@@ -1,0 +1,47 @@
+lzc-sdk-version: "0.1"
+package: f00700f.lazycat-mem9
+version: 1.0.13
+name: lazycat-mem9
+description: 面向懒猫微服的单用户 mem9，内置 MySQL。
+homepage: https://github.com/f00700f/lazycat-mem9
+author: f00700f
+
+application:
+  subdomain: lazycat-mem9
+  background_task: true
+  public_path:
+    - /
+  routes:
+    - >-
+      /=exec://8080,/bin/sh /lzcapp/pkg/content/run.sh
+      '{{ .U.api_key }}'
+      '{{ .U.tenant_name }}'
+      '{{ .U.ingest_mode }}'
+      '{{ .U.llm_api_key }}'
+      '{{ .U.llm_base_url }}'
+      '{{ .U.llm_model }}'
+      '{{ stable_secret "mysql_user_password" }}'
+  depends_on:
+    - mysql
+
+services:
+  mysql:
+    image: registry.lazycat.cloud/mysql
+    environment:
+      - MYSQL_DATABASE=mnemos
+      - MYSQL_USER=mnemos
+      - MYSQL_PASSWORD={{ stable_secret "mysql_user_password" }}
+      - MYSQL_ROOT_PASSWORD={{ stable_secret "mysql_root_password" }}
+    binds:
+      - /lzcapp/var/mysql:/var/lib/mysql
+
+locales:
+  "zh":
+    "name": "lazycat-mem9"
+    "description": "面向懒猫微服的单用户 mem9，内置 MySQL。"
+  "zh_CN":
+    "name": "lazycat-mem9"
+    "description": "面向懒猫微服的单用户 mem9，内置 MySQL。"
+  "en":
+    "name": "lazycat-mem9"
+    "description": "Single-user mem9 for Lazycat with built-in MySQL."

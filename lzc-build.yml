@@ -1,0 +1,8 @@
+name: lazycat-mem9
+package: f00700f.lazycat-mem9
+version: 1.0.13
+manifest: ./lzc-manifest.yml
+pkgout: ./
+icon: ./icon.png
+buildscript: sh ./build.sh
+contentdir: ./dist
