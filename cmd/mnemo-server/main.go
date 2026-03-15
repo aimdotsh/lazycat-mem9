@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +24,42 @@ import (
 	"github.com/f00700f/lazycat-mem9/internal/tenant"
 )
 
+type bootstrapState struct {
+	mu      sync.RWMutex
+	handler http.Handler
+	initErr error
+}
+
+func (s *bootstrapState) setReady(handler http.Handler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.handler = handler
+	s.initErr = nil
+}
+
+func (s *bootstrapState) setError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initErr = err
+}
+
+func (s *bootstrapState) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	handler := s.handler
+	initErr := s.initErr
+	s.mu.RUnlock()
+
+	if handler != nil {
+		handler.ServeHTTP(w, r)
+		return
+	}
+	if initErr != nil {
+		serveBootstrapError(w, r, initErr)
+		return
+	}
+	serveBootstrapLoading(w, r)
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -32,22 +69,85 @@ func main() {
 		os.Exit(1)
 	}
 
-	db, err := openDatabaseWithRetry(cfg, logger)
-	if err != nil {
-		logger.Error("failed to connect database", "err", err)
+	bootstrap := &bootstrapState{}
+	rl := middleware.NewRateLimiter(cfg.RateLimit, cfg.RateBurst)
+	defer rl.Stop()
+
+	var (
+		db           *sql.DB
+		tenantPool   *tenant.TenantPool
+		workerCancel context.CancelFunc = func() {}
+	)
+
+	httpSrv := &http.Server{
+		Addr:         ":" + cfg.Port,
+		Handler:      bootstrap,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		router, initDB, initPool, cancelWorker, err := buildReadyHandler(cfg, logger, rl)
+		if err != nil {
+			logger.Error("service bootstrap failed", "err", err)
+			bootstrap.setError(err)
+			return
+		}
+		db = initDB
+		tenantPool = initPool
+		workerCancel = cancelWorker
+		bootstrap.setReady(router)
+	}()
+
+	// Graceful shutdown.
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-sigCh
+		logger.Info("received signal, shutting down", "signal", sig)
+
+		workerCancel()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(ctx); err != nil {
+			logger.Error("shutdown error", "err", err)
+		}
+		if tenantPool != nil {
+			tenantPool.Close()
+		}
+		if db != nil {
+			_ = db.Close()
+		}
+	}()
+
+	logger.Info("starting mnemo server", "port", cfg.Port)
+	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.Error("server error", "err", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	logger.Info("server stopped")
+}
+
+func buildReadyHandler(
+	cfg *config.Config,
+	logger *slog.Logger,
+	rl *middleware.RateLimiter,
+) (http.Handler, *sql.DB, *tenant.TenantPool, context.CancelFunc, error) {
+	db, err := openDatabaseWithRetry(cfg, logger)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
 	logger.Info("database connected", "backend", cfg.DBBackend, "flavor", cfg.DBFlavor)
 
 	if cfg.DBBackend == "tidb" {
 		if err := ensureControlPlaneSchema(context.Background(), db); err != nil {
-			logger.Error("failed to ensure control-plane schema", "err", err)
-			os.Exit(1)
+			_ = db.Close()
+			return nil, nil, nil, nil, err
 		}
 	}
 
-	// Embedder (nil if not configured → keyword-only search).
 	embedder := embed.New(embed.Config{
 		APIKey:  cfg.EmbedAPIKey,
 		BaseURL: cfg.EmbedBaseURL,
@@ -71,7 +171,7 @@ func main() {
 		logger.Warn("plain MySQL mode disables semantic vector search; ignoring embedding provider configuration")
 		embedder = nil
 	}
-	// LLM client (nil if not configured → raw ingest mode).
+
 	llmClient := llm.New(llm.Config{
 		APIKey:      cfg.LLMAPIKey,
 		BaseURL:     cfg.LLMBaseURL,
@@ -84,7 +184,6 @@ func main() {
 		logger.Info("no LLM configured, ingest will use raw mode")
 	}
 
-	// Repositories.
 	tenantRepo := repository.NewTenantRepo(cfg.DBBackend, db)
 	uploadTaskRepo := repository.NewUploadTaskRepo(cfg.DBBackend, db)
 	tenantPool := tenant.NewPool(tenant.PoolConfig{
@@ -94,9 +193,7 @@ func main() {
 		TotalLimit:  cfg.TenantPoolTotalLimit,
 		Backend:     cfg.DBBackend,
 	})
-	defer tenantPool.Close()
 
-	// Services.
 	var zeroClient *tenant.ZeroClient
 	if cfg.TiDBZeroEnabled && cfg.DBBackend == "tidb" {
 		zeroClient = tenant.NewZeroClient(cfg.TiDBZeroAPIURL)
@@ -107,33 +204,20 @@ func main() {
 
 	if cfg.BootstrapTenantEnabled {
 		if err := bootstrapSingleTenant(context.Background(), tenantSvc, tenantRepo, cfg, logger); err != nil {
-			logger.Error("failed to bootstrap default tenant", "err", err)
-			os.Exit(1)
+			tenantPool.Close()
+			_ = db.Close()
+			return nil, nil, nil, nil, err
 		}
 	}
 
-	// Middleware.
 	tenantMW := middleware.ResolveTenant(tenantRepo, tenantPool)
 	apiKeyMW := middleware.ResolveApiKey(tenantRepo, tenantPool)
-	rl := middleware.NewRateLimiter(cfg.RateLimit, cfg.RateBurst)
-	defer rl.Stop()
 	rateMW := rl.Middleware()
 
-	// Handler.
 	srv := handler.NewServer(tenantSvc, uploadTaskRepo, cfg.UploadDir, embedder, llmClient, cfg.EmbedAutoModel, cfg.FTSEnabled, service.IngestMode(cfg.IngestMode), cfg.DBBackend, cfg.BootstrapTenantID, logger)
 	router := srv.Router(tenantMW, rateMW, apiKeyMW)
 
-	httpSrv := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      router,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	// Upload worker (async file ingest).
 	workerCtx, workerCancel := context.WithCancel(context.Background())
-	defer workerCancel()
 	uploadWorker := service.NewUploadWorker(
 		uploadTaskRepo,
 		tenantRepo,
@@ -152,28 +236,61 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown.
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		sig := <-sigCh
-		logger.Info("received signal, shutting down", "signal", sig)
+	return router, db, tenantPool, workerCancel, nil
+}
 
-		workerCancel() // Stop upload worker first.
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := httpSrv.Shutdown(ctx); err != nil {
-			logger.Error("shutdown error", "err", err)
-		}
-	}()
-
-	logger.Info("starting mnemo server", "port", cfg.Port)
-	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Error("server error", "err", err)
-		os.Exit(1)
+func serveBootstrapLoading(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/healthz":
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"starting"}`))
+	case "/SKILL.md":
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("# mem9 is starting\n\nThe service is still warming up. Refresh in a few seconds.\n"))
+	default:
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="3">
+  <title>lazycat-mem9 is starting</title>
+  <style>
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: linear-gradient(180deg, #f7f7f2, #eef1e7); color: #18230f; display: grid; place-items: center; min-height: 100vh; }
+    .card { width: min(92vw, 560px); background: rgba(255,253,248,.92); border: 1px solid #d9dfcf; border-radius: 18px; padding: 28px; box-shadow: 0 10px 34px rgba(24,35,15,.08); }
+    h1 { margin: 0 0 12px; font-size: 28px; }
+    p { line-height: 1.6; color: #3f4b34; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>lazycat-mem9 正在启动</h1>
+    <p>数据库和应用仍在初始化中。页面会在 3 秒后自动刷新，无需手动反复刷新。</p>
+  </div>
+</body>
+</html>`))
 	}
-	logger.Info("server stopped")
+}
+
+func serveBootstrapError(w http.ResponseWriter, r *http.Request, err error) {
+	switch r.URL.Path {
+	case "/healthz":
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"error","error":%q}`, err.Error())))
+	case "/SKILL.md":
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("# mem9 failed to start\n\n" + err.Error() + "\n"))
+	default:
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("<!doctype html><html lang=\"zh-CN\"><body><h1>lazycat-mem9 启动失败</h1><p>" + err.Error() + "</p></body></html>"))
+	}
 }
 
 func ensureControlPlaneSchema(ctx context.Context, db *sql.DB) error {

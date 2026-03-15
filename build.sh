@@ -20,7 +20,7 @@ fi
 
 if [ -n "${GO_BIN}" ]; then
   cd "${ROOT_DIR}"
-  GOCACHE="${ROOT_DIR}/.cache/go-build" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "${GO_BIN}" build -o "${DIST_DIR}/mnemo-server" ./cmd/mnemo-server
+  GOCACHE="${ROOT_DIR}/.cache/go-build" GOMODCACHE="${ROOT_DIR}/.cache/go-mod" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "${GO_BIN}" build -o "${DIST_DIR}/mnemo-server" ./cmd/mnemo-server
 elif command -v docker >/dev/null 2>&1; then
   mkdir -p "${ROOT_DIR}/.cache/go-build" "${ROOT_DIR}/.cache/go-mod"
   docker run --rm \
